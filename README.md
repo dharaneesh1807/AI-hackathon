@@ -26,3 +26,33 @@ The SQLite database and `.env` are ignored by Git. For PostgreSQL use a SQLAlche
 - Production deployment and end-to-end verification.
 
 The current registration accepts unverified emails; invitation email binding is not proof of email ownership. This prototype must not be used with real health information. JWTs expire after one hour. Access checks are applied server-side for each profile. The in-process rate limiter is only a development safeguard. Local tests use temporary SQLite databases.
+
+## Phase 2: CarePulse
+
+This update adds two tables (`doses`, `care_events`) without changing the Phase 1 table schemas. Back up your local database before updating. On startup, SQLAlchemy creates the additional tables. Existing accounts, medications and appointments are retained. Existing medication schedules begin generating future doses when the first refresh runs; past doses are not fabricated.
+
+- Daily scheduled doses are snapshotted in UTC using the patient profile's IANA timezone. The engine schedules today through the next seven calendar days; refresh regularly to extend the horizon.
+- A dose becomes `due`, then `unconfirmed` after a prototype 30-minute grace period. Unconfirmed means no report was received, not proof that medication was missed.
+- Owners can report `taken`, `skipped` or `help_requested`. Caregivers can report on behalf of the patient with a note. Family members can read records and coordinate follow-ups, but cannot mark a dose taken.
+- Follow-ups can be claimed, released or resolved. Resolution does not automatically mark the dose taken. The audit timeline records changes and the actor. Repeated confirmation is idempotent, conflicting terminal reports are rejected.
+- Medication edits/deletion cancel future scheduled doses while preserving historical snapshots. Caregiver revocation releases outstanding claims.
+
+### CarePulse endpoints
+
+All profile endpoints require the Phase 1 bearer token and appropriate membership.
+
+| Method | Path |
+| --- | --- |
+| POST | `/profiles/{profile_id}/carepulse/refresh` |
+| GET | `/profiles/{profile_id}/carepulse/doses` |
+| GET | `/profiles/{profile_id}/carepulse/alerts` |
+| POST | `/profiles/{profile_id}/carepulse/doses/{dose_id}/record` |
+| POST | `/profiles/{profile_id}/carepulse/doses/{dose_id}/follow-up` |
+| GET | `/profiles/{profile_id}/carepulse/timeline` |
+| POST | `/internal/carepulse/refresh` |
+
+The internal endpoint is disabled unless a separate `SCHEDULER_SECRET` is configured; provide it as the `X-Scheduler-Token` header. Use a strong random secret, never put it in the public repository. This endpoint processes all profiles and returns aggregate counts only. No external scheduler or email delivery is configured in this phase. To check locally, an owner/caregiver can call the profile refresh endpoint in Swagger; the eventual external scheduler must call the internal endpoint periodically over HTTPS.
+
+Record body: `{"status":"taken"}`. Follow-up body: `{"action":"claim"}` or `{"action":"resolve","note":"Contacted patient; outcome recorded"}`. Use fictional patient data only. This is a prototype, not medical monitoring or emergency response. It does not recommend taking an additional dose, changing medication, or changing clinical instructions.
+
+Tests: `python -m pytest -q` (10 tests: 5 original + 5 CarePulse). The automated tests use SQLite and an injected clock; PostgreSQL concurrency and deployment, email delivery, user-facing accessibility, and clinical readiness are not yet verified. PostgreSQL row locks serialize per-profile modifications; SQLite is intended for local single-instance testing. A prolonged scheduler outage beyond the generation horizon needs an explicit reconciliation process.

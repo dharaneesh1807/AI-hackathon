@@ -1,4 +1,4 @@
-"""API foundation. No live medical alerts are sent in phase 1."""
+"""Catalyst ElderCare API. Phase 2 records follow-ups; email delivery is not yet enabled."""
 import hashlib
 import hmac
 import os
@@ -12,13 +12,14 @@ import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import create_engine, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from .models import Appointment, Base, Invitation, Medication, Membership, Profile, User
+from .models import Appointment, Base, CareEvent, Dose, Invitation, Medication, Membership, Profile, User
+from . import carepulse as cp
 from .schemas import AppointmentInput, InviteInput, JoinInput, Login, MedicationInput, ProfileInput, Register
 
 load_dotenv()
@@ -26,7 +27,7 @@ password_hasher = PasswordHasher()
 bearer = HTTPBearer(auto_error=False)
 
 
-def create_app(database_url: str, secret: str):
+def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret=None):
     if len(secret) < 32:
         raise RuntimeError('JWT_SECRET must contain at least 32 characters')
     # Render/Postgres providers may use the legacy postgres:// scheme.
@@ -45,7 +46,7 @@ def create_app(database_url: str, secret: str):
         yield
         engine.dispose()
 
-    app = FastAPI(title='Catalyst ElderCare', version='0.1.0', lifespan=lifespan)
+    app = FastAPI(title='Catalyst ElderCare', version='0.2.0', lifespan=lifespan)
 
     def db():
         with sessions() as session:
@@ -109,7 +110,7 @@ def create_app(database_url: str, secret: str):
 
     @app.get('/')
     def root():
-        return {'service': 'Catalyst ElderCare', 'phase': 1, 'docs': '/docs'}
+        return {'service': 'Catalyst ElderCare', 'phase': 2, 'docs': '/docs'}
 
     @app.get('/health')
     def health(session: Session = Depends(db)):
@@ -201,6 +202,9 @@ def create_app(database_url: str, secret: str):
         member = membership(session, profile_id, member_id)
         if member.role == 'owner':
             raise HTTPException(400, 'Owner cannot be removed')
+        cp.lock_profile(session, profile_id)
+        for dose in session.scalars(select(Dose).where(Dose.profile_id == profile_id, Dose.claimed_by == member_id, Dose.follow_up == 'claimed')):
+            cp.change(session, dose, int(clock()), 'follow_up_released', user.id, 'Care circle access revoked', follow_up='open', claimed_by=None)
         session.delete(member)
         session.commit()
         return Response(status_code=204)
@@ -212,26 +216,36 @@ def create_app(database_url: str, secret: str):
 
     @app.post('/profiles/{profile_id}/medications', status_code=201)
     def add_med(profile_id: int, data: MedicationInput, user: User = Depends(current_user), session: Session = Depends(db)):
+        p = cp.lock_profile(session, profile_id)
         membership(session, profile_id, user.id, {'owner', 'caregiver'})
         m = Medication(profile_id=profile_id, **data.model_dump(exclude={'times'}), times=','.join(data.times))
         session.add(m)
+        session.flush()
+        cp.seed_medication(session, p, m, int(clock()))
         session.commit()
         return med_json(m)
 
     @app.put('/profiles/{profile_id}/medications/{item_id}')
     def edit_med(profile_id: int, item_id: int, data: MedicationInput, user: User = Depends(current_user), session: Session = Depends(db)):
+        p = cp.lock_profile(session, profile_id)
         membership(session, profile_id, user.id, {'owner', 'caregiver'})
         m = item_for(session, Medication, profile_id, item_id)
+        now = int(clock())
+        cp.cancel_future(session, m, now)
         for key, value in data.model_dump(exclude={'times'}).items():
             setattr(m, key, value)
         m.times = ','.join(data.times)
+        cp.seed_medication(session, p, m, now)
         session.commit()
         return med_json(m)
 
     @app.delete('/profiles/{profile_id}/medications/{item_id}', status_code=204)
     def delete_med(profile_id: int, item_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+        cp.lock_profile(session, profile_id)
         membership(session, profile_id, user.id, {'owner', 'caregiver'})
-        session.delete(item_for(session, Medication, profile_id, item_id))
+        m = item_for(session, Medication, profile_id, item_id)
+        cp.cancel_future(session, m, int(clock()))
+        session.delete(m)
         session.commit()
         return Response(status_code=204)
 
@@ -265,8 +279,70 @@ def create_app(database_url: str, secret: str):
         session.commit()
         return Response(status_code=204)
 
+    @app.post('/profiles/{profile_id}/carepulse/refresh')
+    def refresh_care(profile_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+        p = cp.lock_profile(session, profile_id)
+        membership(session, profile_id, user.id, {'owner', 'caregiver'})
+        count = cp.refresh(session, p, int(clock()))
+        session.commit()
+        return {'new_unconfirmed': count}
+
+    @app.get('/profiles/{profile_id}/carepulse/doses')
+    def list_doses(profile_id: int, limit: int = Query(100, ge=1, le=500),
+                   offset: int = Query(0, ge=0), user: User = Depends(current_user), session: Session = Depends(db)):
+        membership(session, profile_id, user.id)
+        rows = session.scalars(select(Dose).where(Dose.profile_id == profile_id, Dose.status != 'cancelled')
+                   .order_by(Dose.due_at.desc(), Dose.id.desc()).offset(offset).limit(limit))
+        return [cp.dose_json(d) for d in rows]
+
+    @app.get('/profiles/{profile_id}/carepulse/alerts')
+    def alerts(profile_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+        membership(session, profile_id, user.id)
+        rows = session.scalars(select(Dose).where(Dose.profile_id == profile_id, Dose.follow_up.in_(['open', 'claimed']))
+                   .order_by(Dose.due_at).limit(500))
+        return [cp.dose_json(d) for d in rows]
+
+    @app.post('/profiles/{profile_id}/carepulse/doses/{dose_id}/record')
+    def record(profile_id: int, dose_id: int, data: cp.DoseAction, user: User = Depends(current_user), session: Session = Depends(db)):
+        cp.lock_profile(session, profile_id)
+        member = membership(session, profile_id, user.id, {'owner', 'caregiver'})
+        d = item_for(session, Dose, profile_id, dose_id)
+        cp.record_dose(session, d, data, user.id, member.role, int(clock()))
+        session.commit()
+        return cp.dose_json(d)
+
+    @app.post('/profiles/{profile_id}/carepulse/doses/{dose_id}/follow-up')
+    def handle_follow_up(profile_id: int, dose_id: int, data: cp.FollowUpAction, user: User = Depends(current_user), session: Session = Depends(db)):
+        cp.lock_profile(session, profile_id)
+        member = membership(session, profile_id, user.id)
+        d = item_for(session, Dose, profile_id, dose_id)
+        cp.follow_up(session, d, data, user.id, member.role, int(clock()))
+        session.commit()
+        return cp.dose_json(d)
+
+    @app.get('/profiles/{profile_id}/carepulse/timeline')
+    def timeline(profile_id: int, limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0),
+                 user: User = Depends(current_user), session: Session = Depends(db)):
+        membership(session, profile_id, user.id)
+        rows = session.scalars(select(CareEvent).where(CareEvent.profile_id == profile_id)
+                               .order_by(CareEvent.at.desc(), CareEvent.id.desc()).offset(offset).limit(limit))
+        return [cp.event_json(e) for e in rows]
+
+    @app.post('/internal/carepulse/refresh')
+    def scheduler_refresh(x_scheduler_token: str | None = Header(default=None), session: Session = Depends(db)):
+        if not scheduler_secret or not x_scheduler_token or not hmac.compare_digest(scheduler_secret, x_scheduler_token):
+            raise HTTPException(401, 'Invalid scheduler credentials')
+        now = int(clock())
+        ids = list(session.scalars(select(Profile.id).order_by(Profile.id)))
+        count = 0
+        for pid in ids:
+            p = cp.lock_profile(session, pid)
+            count += cp.refresh(session, p, now)
+            session.commit()
+        return {'profiles_processed': len(ids), 'new_unconfirmed': count}
+
     return app
 
 
 def create_from_env():
-    return create_app(os.getenv('DATABASE_URL', 'sqlite:///./eldercare.db'), os.environ['JWT_SECRET'])
+    return create_app(os.getenv('DATABASE_URL', 'sqlite:///./eldercare.db'), os.environ['JWT_SECRET'], scheduler_secret=os.getenv('SCHEDULER_SECRET'))

@@ -59,3 +59,31 @@ class Appointment(Base):
     doctor: Mapped[str] = mapped_column(String(120))
     starts_at: Mapped[str] = mapped_column(String(40))  # UTC ISO-8601
     location: Mapped[str] = mapped_column(String(200), default='')
+
+
+class Dose(Base):
+    """A historical snapshot, independent of later prescription edits/deletion."""
+    __tablename__ = 'doses'
+    __table_args__ = (UniqueConstraint('profile_id', 'medication_id', 'due_at'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
+    medication_id: Mapped[int] = mapped_column(index=True)
+    medication_name: Mapped[str] = mapped_column(String(120))
+    dosage: Mapped[str] = mapped_column(String(120))
+    instructions: Mapped[str] = mapped_column(Text)
+    due_at: Mapped[int] = mapped_column(index=True)  # UTC epoch seconds
+    status: Mapped[str] = mapped_column(String(20), default='scheduled')
+    follow_up: Mapped[str] = mapped_column(String(16), default='none')
+    claimed_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    version: Mapped[int] = mapped_column(default=0)
+
+
+class CareEvent(Base):
+    __tablename__ = 'care_events'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
+    dose_id: Mapped[int] = mapped_column(ForeignKey('doses.id'), index=True)
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    action: Mapped[str] = mapped_column(String(32))
+    at: Mapped[int] = mapped_column(index=True)
+    note: Mapped[str] = mapped_column(Text, default='')
