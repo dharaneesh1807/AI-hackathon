@@ -71,3 +71,44 @@ No Node.js, npm, external CDN, or frontend build step is needed. The responsive 
 Try registering a fictional account, creating a profile, adding a medication with a future daily time, and refreshing the care status after the scheduled time. Create a second account with a different fictional email, generate an invitation as the owner, and join as the invited account. Use the profile owner's or caregiver's dashboard to add/edit schedules, record actual dose status, and claim/resolve follow-ups. The family role can read records and coordinate follow-ups but cannot edit prescriptions or record adherence. Appointment time input uses the device timezone and display uses the profile timezone. The CarePulse engine uses a seven-day future schedule horizon; the dashboard retrieves up to 500 dose records and 100 timeline records.
 
 Comfort mode includes larger medication controls, simplified navigation, English/Tamil labels for key actions, and browser speech synthesis (voice availability varies). Other screens and some labels remain English. This is not a complete localization or accessibility certification. Automatic scheduler execution, email delivery, Google Calendar synchronization, production database verification and deployment are still pending. Do not use real healthcare data or rely on the prototype for clinical care.
+
+## Phase 4 — Google email reminders and calendar handoff
+
+This upgrade adds `email_preferences` and `email_attempts` tables on startup, preserving existing records. It includes a private Google Apps Script scheduler (`google-integration/Code.gs`) that polls over HTTPS every five minutes, refreshes CarePulse, sends privacy-minimal reminders using Google MailApp and reports results. No Google Cloud Run or billing setup is needed for this script in a personal Google account, subject to Apps Script quotas and account restrictions. The script must be installed and authorized by the operator. The backend does not send email by itself.
+
+### Reminder behavior
+
+- Upcoming scheduled dose: within 15 minutes, to opted-in profile owner.
+- Unconfirmed dose: after CarePulse grace period, to opted-in members with an open or claimed follow-up (within the previous 24 hours). Unconfirmed is not proof of a missed dose.
+- Appointment: within 24 hours, to opted-in members. A rescheduled appointment can produce a new reminder.
+- Each event/recipient has a unique database attempt. Repeated polls do not resend it. `sent` means MailApp reported success, not that the recipient read or received it. `failed` or `dispatched` without acknowledgment means delivery failed or is uncertain; this prototype intentionally does not retry ambiguous attempts to avoid duplicate notifications. Check the UI and Apps Script execution logs. A scheduler outage can miss a reminder window. No health information, medication names, patient names or dosages are included in emails.
+- Public registration does not verify email ownership. To prevent sending mail to arbitrary addresses, the deployment administrator must allowlist only inboxes they control or whose owners consent to the demo. Each logged-in member also must opt in from **Care Circle → Email reminder settings**. Never use real patient data. Revoking access removes the preference. Messages already dispatched cannot be recalled.
+
+### Deploy the website first (Render)
+
+Create a persistent PostgreSQL database (e.g. a managed provider). Use its SQLAlchemy-compatible connection string in Render, including TLS as required by the provider. Create a Render Web Service from the public GitHub repo, runtime Python, build `pip install -r requirements.txt`, start `python -m uvicorn backend.main:create_from_env --factory --host 0.0.0.0 --port $PORT`, health check `/health`. The included `render.yaml` is an optional blueprint. Supply environment variables through Render's dashboard, never in Git:
+
+- `DATABASE_URL`: managed PostgreSQL connection string; do not use local SQLite in Render.
+- `JWT_SECRET`: unique random secret of 32+ characters.
+- `SCHEDULER_SECRET`: separate random 32+ character secret (same value in Apps Script).
+- `DEMO_EMAIL_ALLOWLIST`: comma-separated consenting test inbox addresses; no spaces required.
+
+To generate a secret locally: `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Run twice for distinct values; do not send screenshots containing them. Verify the deployed homepage, `/health`, and a fictional account before configuring reminders. PostgreSQL and hosted service operation still need verification on your own deployment.
+
+### Install the private Google scheduler
+
+1. Visit https://script.google.com/ and create a new project. Copy `google-integration/Code.gs` into its editor. No need to deploy it as a web app.
+2. In Project Settings → Script properties add `APP_URL` (your Render HTTPS URL without a trailing slash) and `SCHEDULER_SECRET` (exactly the Render value). Keep the script private.
+3. In the deployed site, register using a test inbox from the allowlist, create a fictional profile, and enable Email reminders in Care Circle. Add an appointment scheduled within the next 24 hours and a dose 5–15 minutes in the future.
+4. Select `runCareReminders` and click Run. Authorize the script to make external requests and send mail from your Google account. Check the inbox and the recent delivery attempts in Care Circle. Select `installTrigger` and Run once to install the five-minute repeating trigger.
+5. Confirm a second run does not send duplicate reminders. For the unconfirmed scenario, leave the fictional dose unconfirmed until after the 30-minute grace period and run again. Check Apps Script Executions for failures. Delete the trigger after the competition if it is no longer needed.
+
+The script uses MailApp quotas and checks remaining quota before dispatch. Render free-tier cold starts and trigger timing are not guaranteed; this is a demonstration, not emergency or clinical monitoring.
+
+### Google Calendar
+
+Appointments have an **Add to Google Calendar** link with a generic title, UTC start time and suggested 30-minute duration. The user reviews and saves the event manually in their own calendar. No patient or doctor names are sent in the link. This is a calendar handoff, not OAuth synchronization; edits/deletion in ElderCare do not change a saved Calendar event. Appointment email reminders are independently handled by MailApp.
+
+### Verification
+
+`python -m pytest -q` — 13 tests (11 previous + 2 notification tests). The new tests verify scheduler authentication, opt-in, allowlist, cross-profile isolation, duplicate prevention, privacy-minimal content, acknowledgment, appointment reminders and revocation. JavaScript syntax checked with Node. Live Google authorization, actual email delivery, browser flows and Render/PostgreSQL deployment are not verified by these tests.

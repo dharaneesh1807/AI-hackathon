@@ -1,4 +1,4 @@
-"""Catalyst ElderCare API. Phase 2 records follow-ups; email delivery is not yet enabled."""
+"""Catalyst ElderCare API with privacy-minimal demo reminder dispatch."""
 import hashlib
 import hmac
 import os
@@ -21,8 +21,9 @@ from sqlalchemy import create_engine, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from .models import Appointment, Base, CareEvent, Dose, Invitation, Medication, Membership, Profile, User
+from .models import Appointment, Base, CareEvent, Dose, EmailAttempt, EmailPreference, Invitation, Medication, Membership, Profile, User
 from . import carepulse as cp
+from . import notifications as nt
 from .schemas import AppointmentInput, InviteInput, JoinInput, Login, MedicationInput, ProfileInput, Register
 
 load_dotenv()
@@ -30,7 +31,7 @@ password_hasher = PasswordHasher()
 bearer = HTTPBearer(auto_error=False)
 
 
-def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret=None):
+def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret=None, demo_email_allowlist=()):
     if len(secret) < 32:
         raise RuntimeError('JWT_SECRET must contain at least 32 characters')
     # Render/Postgres providers may use the legacy postgres:// scheme.
@@ -49,7 +50,7 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
         yield
         engine.dispose()
 
-    app = FastAPI(title='Catalyst ElderCare', version='0.3.0', lifespan=lifespan)
+    app = FastAPI(title='Catalyst ElderCare', version='0.4.0', lifespan=lifespan)
 
     def db():
         with sessions() as session:
@@ -223,6 +224,9 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
         cp.lock_profile(session, profile_id)
         for dose in session.scalars(select(Dose).where(Dose.profile_id == profile_id, Dose.claimed_by == member_id, Dose.follow_up == 'claimed')):
             cp.change(session, dose, int(clock()), 'follow_up_released', user.id, 'Care circle access revoked', follow_up='open', claimed_by=None)
+        pref = session.scalar(select(EmailPreference).where(EmailPreference.profile_id == profile_id, EmailPreference.user_id == member_id))
+        if pref is not None:
+            session.delete(pref)
         session.delete(member)
         session.commit()
         return Response(status_code=204)
@@ -359,8 +363,62 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
             session.commit()
         return {'profiles_processed': len(ids), 'new_unconfirmed': count}
 
+    def scheduler_auth(token):
+        if not scheduler_secret or not token or not hmac.compare_digest(scheduler_secret, token):
+            raise HTTPException(401, 'Invalid scheduler credentials')
+
+    @app.get('/profiles/{profile_id}/email-reminders')
+    def email_preferences(profile_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+        membership(session, profile_id, user.id)
+        pref = session.scalar(select(EmailPreference).where(EmailPreference.profile_id == profile_id, EmailPreference.user_id == user.id))
+        attempts = session.scalars(select(EmailAttempt).where(EmailAttempt.profile_id == profile_id, EmailAttempt.user_id == user.id).order_by(EmailAttempt.id.desc()).limit(10))
+        return {'available': user.email in demo_email_allowlist, 'enabled': bool(pref and pref.enabled),
+                'recent': [{'kind': a.kind, 'status': a.status, 'at': cp.iso(a.created_at)} for a in attempts]}
+
+    @app.put('/profiles/{profile_id}/email-reminders')
+    def set_email_preferences(profile_id: int, data: nt.Preference, user: User = Depends(current_user), session: Session = Depends(db)):
+        cp.lock_profile(session, profile_id)
+        membership(session, profile_id, user.id)
+        if data.enabled and user.email not in demo_email_allowlist:
+            raise HTTPException(403, 'This demo inbox has not been approved by the deployment administrator')
+        pref = session.scalar(select(EmailPreference).where(EmailPreference.profile_id == profile_id, EmailPreference.user_id == user.id))
+        if pref is None:
+            pref = EmailPreference(profile_id=profile_id, user_id=user.id, enabled=data.enabled)
+            session.add(pref)
+        else:
+            pref.enabled = data.enabled
+        session.commit()
+        return {'enabled': pref.enabled}
+
+    @app.post('/internal/email/dispatch')
+    def email_dispatch(limit: int = Query(10, ge=1, le=20), x_scheduler_token: str | None = Header(default=None), session: Session = Depends(db)):
+        scheduler_auth(x_scheduler_token)
+        now = int(clock())
+        ids = list(session.scalars(select(Profile.id).order_by(Profile.id)))
+        messages = []
+        for pid in ids:
+            p = cp.lock_profile(session, pid)
+            cp.refresh(session, p, now)
+            messages.extend(nt.dispatch(session, pid, now, demo_email_allowlist, limit-len(messages)))
+            session.commit()
+        return {'messages': messages}
+
+    @app.post('/internal/email/{attempt_id}/result')
+    def email_result(attempt_id: int, data: nt.DeliveryResult, x_scheduler_token: str | None = Header(default=None), session: Session = Depends(db)):
+        scheduler_auth(x_scheduler_token)
+        row = session.get(EmailAttempt, attempt_id)
+        if row is None:
+            raise HTTPException(404, 'Attempt not found')
+        if row.status == data.status:
+            return {'status': row.status}
+        result = session.execute(update(EmailAttempt).where(EmailAttempt.id == attempt_id, EmailAttempt.status == 'dispatched').values(status=data.status))
+        if result.rowcount != 1:
+            raise HTTPException(409, 'Attempt already finalized')
+        session.commit()
+        return {'status': data.status}
+
     return app
 
 
 def create_from_env():
-    return create_app(os.getenv('DATABASE_URL', 'sqlite:///./eldercare.db'), os.environ['JWT_SECRET'], scheduler_secret=os.getenv('SCHEDULER_SECRET'))
+    return create_app(os.getenv('DATABASE_URL', 'sqlite:///./eldercare.db'), os.environ['JWT_SECRET'], scheduler_secret=os.getenv('SCHEDULER_SECRET'), demo_email_allowlist=tuple(e.strip().lower() for e in os.getenv('DEMO_EMAIL_ALLOWLIST','').split(',') if e.strip()))

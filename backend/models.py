@@ -87,3 +87,24 @@ class CareEvent(Base):
     action: Mapped[str] = mapped_column(String(32))
     at: Mapped[int] = mapped_column(index=True)
     note: Mapped[str] = mapped_column(Text, default='')
+
+
+class EmailPreference(Base):
+    __tablename__ = 'email_preferences'
+    __table_args__ = (UniqueConstraint('profile_id', 'user_id'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
+    enabled: Mapped[bool] = mapped_column(default=False)
+
+
+class EmailAttempt(Base):
+    __tablename__ = 'email_attempts'
+    __table_args__ = (UniqueConstraint('profile_id', 'user_id', 'event_key'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
+    event_key: Mapped[str] = mapped_column(String(120))
+    kind: Mapped[str] = mapped_column(String(30))
+    status: Mapped[str] = mapped_column(String(20), default='dispatched')
+    created_at: Mapped[int]
