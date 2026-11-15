@@ -7,7 +7,7 @@ class Base(DeclarativeBase):
 
 
 class User(Base):
-    __tablename__ = 'users'
+    __tablename__ = "users"
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(254), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(100))
@@ -15,25 +15,25 @@ class User(Base):
 
 
 class Profile(Base):
-    __tablename__ = 'profiles'
+    __tablename__ = "profiles"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100))
     timezone: Mapped[str] = mapped_column(String(80))
 
 
 class Membership(Base):
-    __tablename__ = 'memberships'
-    __table_args__ = (UniqueConstraint('profile_id', 'user_id'),)
+    __tablename__ = "memberships"
+    __table_args__ = (UniqueConstraint("profile_id", "user_id"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     role: Mapped[str] = mapped_column(String(16))
 
 
 class Invitation(Base):
-    __tablename__ = 'invitations'
+    __tablename__ = "invitations"
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
     email: Mapped[str] = mapped_column(String(254))
     code_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     role: Mapped[str] = mapped_column(String(16))
@@ -42,133 +42,141 @@ class Invitation(Base):
 
 
 class Medication(Base):
-    __tablename__ = 'medications'
+    __tablename__ = "medications"
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
     name: Mapped[str] = mapped_column(String(120))
     dosage: Mapped[str] = mapped_column(String(120))
     times: Mapped[str] = mapped_column(Text)  # comma-separated HH:MM local times
-    instructions: Mapped[str] = mapped_column(Text, default='')
+    instructions: Mapped[str] = mapped_column(Text, default="")
 
 
 class Appointment(Base):
-    __tablename__ = 'appointments'
+    __tablename__ = "appointments"
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
     title: Mapped[str] = mapped_column(String(150))
     doctor: Mapped[str] = mapped_column(String(120))
     starts_at: Mapped[str] = mapped_column(String(40))  # UTC ISO-8601
-    location: Mapped[str] = mapped_column(String(200), default='')
+    location: Mapped[str] = mapped_column(String(200), default="")
 
 
 class Dose(Base):
     """A historical snapshot, independent of later prescription edits/deletion."""
-    __tablename__ = 'doses'
-    __table_args__ = (UniqueConstraint('profile_id', 'medication_id', 'due_at'),)
+
+    __tablename__ = "doses"
+    __table_args__ = (UniqueConstraint("profile_id", "medication_id", "due_at"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
     medication_id: Mapped[int] = mapped_column(index=True)
     medication_name: Mapped[str] = mapped_column(String(120))
     dosage: Mapped[str] = mapped_column(String(120))
     instructions: Mapped[str] = mapped_column(Text)
     due_at: Mapped[int] = mapped_column(index=True)  # UTC epoch seconds
-    status: Mapped[str] = mapped_column(String(20), default='scheduled')
-    follow_up: Mapped[str] = mapped_column(String(16), default='none')
-    claimed_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="scheduled")
+    follow_up: Mapped[str] = mapped_column(String(16), default="none")
+    claimed_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
     version: Mapped[int] = mapped_column(default=0)
 
 
 class CareEvent(Base):
-    __tablename__ = 'care_events'
+    __tablename__ = "care_events"
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
-    dose_id: Mapped[int] = mapped_column(ForeignKey('doses.id'), index=True)
-    actor_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
+    dose_id: Mapped[int] = mapped_column(ForeignKey("doses.id"), index=True)
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     action: Mapped[str] = mapped_column(String(32))
     at: Mapped[int] = mapped_column(index=True)
-    note: Mapped[str] = mapped_column(Text, default='')
+    note: Mapped[str] = mapped_column(Text, default="")
 
 
 class EmailPreference(Base):
-    __tablename__ = 'email_preferences'
-    __table_args__ = (UniqueConstraint('profile_id', 'user_id'),)
+    __tablename__ = "email_preferences"
+    __table_args__ = (UniqueConstraint("profile_id", "user_id"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     enabled: Mapped[bool] = mapped_column(default=False)
 
 
 class EmailAttempt(Base):
-    __tablename__ = 'email_attempts'
-    __table_args__ = (UniqueConstraint('profile_id', 'user_id', 'event_key'),)
+    __tablename__ = "email_attempts"
+    __table_args__ = (UniqueConstraint("profile_id", "user_id", "event_key"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     event_key: Mapped[str] = mapped_column(String(120))
     kind: Mapped[str] = mapped_column(String(30))
-    status: Mapped[str] = mapped_column(String(20), default='dispatched')
+    status: Mapped[str] = mapped_column(String(20), default="dispatched")
     created_at: Mapped[int]
 
 
 class MedicationSupply(Base):
     """Optional stock measured in prescribed dose units, not tablets or mg."""
-    __tablename__ = 'medication_supplies'
-    __table_args__ = (UniqueConstraint('profile_id', 'medication_id'),)
+
+    __tablename__ = "medication_supplies"
+    __table_args__ = (UniqueConstraint("profile_id", "medication_id"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
-    medication_id: Mapped[int] = mapped_column(ForeignKey('medications.id', ondelete='CASCADE'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
+    medication_id: Mapped[int] = mapped_column(
+        ForeignKey("medications.id", ondelete="CASCADE"), index=True
+    )
     remaining: Mapped[int]
     threshold_days: Mapped[int]
     updated_at: Mapped[int]
 
 
 class VoicePreference(Base):
-    __tablename__ = 'voice_preferences'
-    __table_args__ = (UniqueConstraint('profile_id', 'user_id'),)
+    __tablename__ = "voice_preferences"
+    __table_args__ = (UniqueConstraint("profile_id", "user_id"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     enabled: Mapped[bool] = mapped_column(default=False)
 
 
 class VoiceAttempt(Base):
-    __tablename__ = 'voice_attempts'
-    __table_args__ = (UniqueConstraint('profile_id', 'user_id', 'dose_id'),)
+    __tablename__ = "voice_attempts"
+    __table_args__ = (UniqueConstraint("profile_id", "user_id", "dose_id"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
-    dose_id: Mapped[int] = mapped_column(ForeignKey('doses.id'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    dose_id: Mapped[int] = mapped_column(ForeignKey("doses.id"), index=True)
     created_at: Mapped[int] = mapped_column(index=True)
-    status: Mapped[str] = mapped_column(String(20), default='dispatched')
+    status: Mapped[str] = mapped_column(String(20), default="dispatched")
 
 
 class EmergencyContact(Base):
-    __tablename__ = 'emergency_contacts'
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), primary_key=True)
-    doctor_name: Mapped[str] = mapped_column(String(120), default='')
-    doctor_phone: Mapped[str] = mapped_column(String(20), default='')
-    family_name: Mapped[str] = mapped_column(String(120), default='')
-    family_phone: Mapped[str] = mapped_column(String(20), default='')
+    __tablename__ = "emergency_contacts"
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), primary_key=True)
+    doctor_name: Mapped[str] = mapped_column(String(120), default="")
+    doctor_phone: Mapped[str] = mapped_column(String(20), default="")
+    family_name: Mapped[str] = mapped_column(String(120), default="")
+    family_phone: Mapped[str] = mapped_column(String(20), default="")
 
 
 class WellnessCheck(Base):
-    __tablename__ = 'wellness_checks'
-    __table_args__ = (UniqueConstraint('profile_id', 'day'),)
+    __tablename__ = "wellness_checks"
+    __table_args__ = (UniqueConstraint("profile_id", "day"),)
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
     day: Mapped[str] = mapped_column(String(10))
     mood: Mapped[str] = mapped_column(String(20))
     sleep: Mapped[str] = mapped_column(String(20))
     water: Mapped[str] = mapped_column(String(20))
     at: Mapped[int]
-    help_status: Mapped[str] = mapped_column(String(20), default='none')
-    handled_by: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    help_status: Mapped[str] = mapped_column(String(20), default="none")
+    handled_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
 
 
 class CareShare(Base):
-    __tablename__ = 'care_shares'
+    __tablename__ = "care_shares"
     id: Mapped[int] = mapped_column(primary_key=True)
-    profile_id: Mapped[int] = mapped_column(ForeignKey('profiles.id'), index=True)
+    profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), index=True)
     digest: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     expires_at: Mapped[int]
     revoked: Mapped[bool] = mapped_column(default=False)

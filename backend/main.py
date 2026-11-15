@@ -1,12 +1,13 @@
 """Catalyst ElderCare API with privacy-minimal demo reminder dispatch."""
+
 import hashlib
 import hmac
 import os
 import secrets
 import time
-from pathlib import Path
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from pathlib import Path
 from threading import Lock
 
 import jwt
@@ -15,35 +16,74 @@ from argon2.exceptions import VerificationError
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import create_engine, select, update, func
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from .models import Appointment, Base, CareEvent, Dose, EmailAttempt, EmailPreference, Invitation, Medication, Membership, Profile, User, MedicationSupply, VoicePreference, VoiceAttempt
 from . import carepulse as cp
+from . import connected as connected
 from . import notifications as nt
 from . import voice as vc
-from . import connected as connected
-from .schemas import SupplyInput, DisplayNameInput, AppointmentInput, InviteInput, JoinInput, Login, MedicationInput, ProfileInput, Register
+from .models import (
+    Appointment,
+    Base,
+    CareEvent,
+    Dose,
+    EmailAttempt,
+    EmailPreference,
+    Invitation,
+    Medication,
+    MedicationSupply,
+    Membership,
+    Profile,
+    User,
+    VoiceAttempt,
+    VoicePreference,
+)
+from .schemas import (
+    AppointmentInput,
+    DisplayNameInput,
+    InviteInput,
+    JoinInput,
+    Login,
+    MedicationInput,
+    ProfileInput,
+    Register,
+    SupplyInput,
+)
 
 load_dotenv()
 password_hasher = PasswordHasher()
 bearer = HTTPBearer(auto_error=False)
 
 
-def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret=None, demo_email_allowlist=(), voice_recipients=None, voice_threshold=60):
+def create_app(
+    database_url: str,
+    secret: str,
+    clock=time.time,
+    scheduler_secret=None,
+    demo_email_allowlist=(),
+    voice_recipients=None,
+    voice_threshold=60,
+):
     voice_recipients = voice_recipients or {}
     voice_threshold = max(30, min(720, int(voice_threshold)))
     if len(secret) < 32:
-        raise RuntimeError('JWT_SECRET must contain at least 32 characters')
+        raise RuntimeError("JWT_SECRET must contain at least 32 characters")
     # Render/Postgres providers may use the legacy postgres:// scheme.
-    if database_url.startswith('postgres://'):
-        database_url = database_url.replace('postgres://', 'postgresql+psycopg2://', 1)
-    elif database_url.startswith('postgresql://'):
-        database_url = database_url.replace('postgresql://', 'postgresql+psycopg2://', 1)
-    options = {'connect_args': {'check_same_thread': False}} if database_url.startswith('sqlite') else {'pool_pre_ping': True}
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif database_url.startswith("postgresql://"):
+        database_url = database_url.replace(
+            "postgresql://", "postgresql+psycopg2://", 1
+        )
+    options = (
+        {"connect_args": {"check_same_thread": False}}
+        if database_url.startswith("sqlite")
+        else {"pool_pre_ping": True}
+    )
     engine = create_engine(database_url, **options)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     dummy_hash = password_hasher.hash(secrets.token_urlsafe(32))
@@ -56,7 +96,7 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
         yield
         engine.dispose()
 
-    app = FastAPI(title='Catalyst ElderCare', version='0.4.0', lifespan=lifespan)
+    app = FastAPI(title="Catalyst ElderCare", version="0.4.0", lifespan=lifespan)
 
     def db():
         with sessions() as session:
@@ -64,7 +104,7 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
 
     def limited(request: Request, category: str):
         # Prototype per-process throttling. Use shared storage for production/multiple workers.
-        key = (category, request.client.host if request.client else 'unknown')
+        key = (category, request.client.host if request.client else "unknown")
         now = time.monotonic()
         with lock:
             if len(attempts) >= 10000 and key not in attempts:
@@ -72,233 +112,421 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
                     if not attempts[old_key] or attempts[old_key][-1] <= now - 60:
                         del attempts[old_key]
                 if len(attempts) >= 10000:
-                    raise HTTPException(429, 'Too many requests')
+                    raise HTTPException(429, "Too many requests")
             q = attempts[key]
             while q and q[0] <= now - 60:
                 q.popleft()
             if len(q) >= 15:
-                raise HTTPException(429, 'Too many attempts; try again in one minute')
+                raise HTTPException(429, "Too many attempts; try again in one minute")
             q.append(now)
 
-    def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer), session: Session = Depends(db)):
+    def current_user(
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+        session: Session = Depends(db),
+    ):
         if not credentials:
-            raise HTTPException(401, 'Login required', headers={'WWW-Authenticate': 'Bearer'})
+            raise HTTPException(
+                401, "Login required", headers={"WWW-Authenticate": "Bearer"}
+            )
         try:
-            claims = jwt.decode(credentials.credentials, secret, algorithms=['HS256'], options={'require': ['exp', 'sub', 'iat']})
-            user = session.get(User, int(claims['sub']))
+            claims = jwt.decode(
+                credentials.credentials,
+                secret,
+                algorithms=["HS256"],
+                options={"require": ["exp", "sub", "iat"]},
+            )
+            user = session.get(User, int(claims["sub"]))
         except (jwt.InvalidTokenError, ValueError, TypeError):
             user = None
         if not user:
-            raise HTTPException(401, 'Invalid or expired session')
+            raise HTTPException(401, "Invalid or expired session")
         return user
 
     def membership(session, profile_id, user_id, roles=None):
-        member = session.scalar(select(Membership).where(Membership.profile_id == profile_id, Membership.user_id == user_id))
+        member = session.scalar(
+            select(Membership).where(
+                Membership.profile_id == profile_id, Membership.user_id == user_id
+            )
+        )
         if not member:
-            raise HTTPException(404, 'Profile not found')
+            raise HTTPException(404, "Profile not found")
         if roles and member.role not in roles:
-            raise HTTPException(403, 'Insufficient permissions')
+            raise HTTPException(403, "Insufficient permissions")
         return member
 
     def item_for(session, model, profile_id, item_id):
-        item = session.scalar(select(model).where(model.id == item_id, model.profile_id == profile_id))
+        item = session.scalar(
+            select(model).where(model.id == item_id, model.profile_id == profile_id)
+        )
         if not item:
-            raise HTTPException(404, 'Item not found')
+            raise HTTPException(404, "Item not found")
         return item
 
     def invite_hash(code):
         return hmac.new(secret.encode(), code.encode(), hashlib.sha256).hexdigest()
 
     def med_json(m):
-        return {'id': m.id, 'name': m.name, 'dosage': m.dosage, 'times': m.times.split(','), 'instructions': m.instructions}
+        return {
+            "id": m.id,
+            "name": m.name,
+            "dosage": m.dosage,
+            "times": m.times.split(","),
+            "instructions": m.instructions,
+        }
 
     def appt_json(a):
-        return {'id': a.id, 'title': a.title, 'doctor': a.doctor, 'starts_at': a.starts_at, 'location': a.location}
+        return {
+            "id": a.id,
+            "title": a.title,
+            "doctor": a.doctor,
+            "starts_at": a.starts_at,
+            "location": a.location,
+        }
 
     def profile_json(p, role):
-        return {'id': p.id, 'name': p.name, 'timezone': p.timezone, 'role': role}
+        return {"id": p.id, "name": p.name, "timezone": p.timezone, "role": role}
 
-    web = Path(__file__).resolve().parent / 'web'
-    app.mount('/assets', StaticFiles(directory=web), name='assets')
+    web = Path(__file__).resolve().parent / "web"
+    app.mount("/assets", StaticFiles(directory=web), name="assets")
 
-    @app.get('/', include_in_schema=False)
+    @app.get("/", include_in_schema=False)
     def root():
-        return FileResponse(web / 'index.html', headers={'Cache-Control': 'no-cache'})
+        return FileResponse(web / "index.html", headers={"Cache-Control": "no-cache"})
 
-    @app.get('/doctor-share', include_in_schema=False)
+    @app.get("/doctor-share", include_in_schema=False)
     def doctor_share():
-        return FileResponse(web / 'share.html', headers={'Cache-Control': 'no-store'})
+        return FileResponse(web / "share.html", headers={"Cache-Control": "no-store"})
 
-    @app.get('/sw.js', include_in_schema=False)
+    @app.get("/sw.js", include_in_schema=False)
     def service_worker():
-        return FileResponse(web / 'sw.js', media_type='application/javascript', headers={'Cache-Control': 'no-cache'})
+        return FileResponse(
+            web / "sw.js",
+            media_type="application/javascript",
+            headers={"Cache-Control": "no-cache"},
+        )
 
-    @app.middleware('http')
+    @app.middleware("http")
     async def browser_security(request: Request, call_next):
         response = await call_next(request)
-        response.headers['X-Content-Type-Options'] = 'nosniff'
-        response.headers['Referrer-Policy'] = 'no-referrer'
-        response.headers['X-Frame-Options'] = 'DENY'
-        if request.url.path in ('/', '/doctor-share') or request.url.path.startswith('/assets/'):
-            response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
+        if request.url.path in ("/", "/doctor-share") or request.url.path.startswith(
+            "/assets/"
+        ):
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+            )
         else:
-            response.headers['Cache-Control'] = 'no-store'
+            response.headers["Cache-Control"] = "no-store"
         return response
 
-    @app.get('/health')
+    @app.get("/health")
     def health(session: Session = Depends(db)):
         session.execute(select(1))
-        return {'status': 'ok'}
+        return {"status": "ok"}
 
-    @app.post('/auth/register', status_code=201)
+    @app.post("/auth/register", status_code=201)
     def register(data: Register, request: Request, session: Session = Depends(db)):
-        limited(request, 'register')
-        user = User(name=data.name, email=data.email, password_hash=password_hasher.hash(data.password))
+        limited(request, "register")
+        user = User(
+            name=data.name,
+            email=data.email,
+            password_hash=password_hasher.hash(data.password),
+        )
         session.add(user)
         try:
             session.commit()
         except IntegrityError:
             session.rollback()
-            raise HTTPException(409, 'Account could not be created')
-        return {'id': user.id, 'name': user.name, 'email': user.email}
+            raise HTTPException(409, "Account could not be created")
+        return {"id": user.id, "name": user.name, "email": user.email}
 
-    @app.post('/auth/login')
+    @app.post("/auth/login")
     def login(data: Login, request: Request, session: Session = Depends(db)):
-        limited(request, 'login')
+        limited(request, "login")
         user = session.scalar(select(User).where(User.email == data.email))
         try:
-            valid = password_hasher.verify(user.password_hash if user else dummy_hash, data.password)
+            valid = password_hasher.verify(
+                user.password_hash if user else dummy_hash, data.password
+            )
         except VerificationError:
             valid = False
         if not user or not valid:
-            raise HTTPException(401, 'Invalid email or password')
+            raise HTTPException(401, "Invalid email or password")
         now = int(time.time())
-        token = jwt.encode({'sub': str(user.id), 'iat': now, 'exp': now + 3600}, secret, algorithm='HS256')
-        return {'access_token': token, 'token_type': 'bearer', 'expires_in': 3600}
+        token = jwt.encode(
+            {"sub": str(user.id), "iat": now, "exp": now + 3600},
+            secret,
+            algorithm="HS256",
+        )
+        return {"access_token": token, "token_type": "bearer", "expires_in": 3600}
 
-    @app.get('/auth/me')
+    @app.get("/auth/me")
     def me(user: User = Depends(current_user)):
-        return {'id': user.id, 'email': user.email, 'name': user.name}
+        return {"id": user.id, "email": user.email, "name": user.name}
 
-    @app.patch('/auth/me')
-    def update_name(data: DisplayNameInput, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.patch("/auth/me")
+    def update_name(
+        data: DisplayNameInput,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         user.name = data.name
         session.commit()
-        return {'id': user.id, 'email': user.email, 'name': user.name}
+        return {"id": user.id, "email": user.email, "name": user.name}
 
-    @app.patch('/profiles/{profile_id}/name')
-    def rename_profile(profile_id: int, data: DisplayNameInput, user: User = Depends(current_user), session: Session = Depends(db)):
-        membership(session, profile_id, user.id, {'owner'})
+    @app.patch("/profiles/{profile_id}/name")
+    def rename_profile(
+        profile_id: int,
+        data: DisplayNameInput,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
+        membership(session, profile_id, user.id, {"owner"})
         p = cp.lock_profile(session, profile_id)
         p.name = data.name
         session.commit()
-        return profile_json(p, 'owner')
+        return profile_json(p, "owner")
 
-    @app.post('/profiles', status_code=201)
-    def create_profile(data: ProfileInput, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.post("/profiles", status_code=201)
+    def create_profile(
+        data: ProfileInput,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         p = Profile(**data.model_dump())
         session.add(p)
         session.flush()
-        session.add(Membership(profile_id=p.id, user_id=user.id, role='owner'))
+        session.add(Membership(profile_id=p.id, user_id=user.id, role="owner"))
         session.commit()
-        return profile_json(p, 'owner')
+        return profile_json(p, "owner")
 
-    @app.get('/profiles')
+    @app.get("/profiles")
     def profiles(user: User = Depends(current_user), session: Session = Depends(db)):
-        rows = session.execute(select(Profile, Membership.role).join(Membership, Membership.profile_id == Profile.id).where(Membership.user_id == user.id).order_by(Profile.id))
+        rows = session.execute(
+            select(Profile, Membership.role)
+            .join(Membership, Membership.profile_id == Profile.id)
+            .where(Membership.user_id == user.id)
+            .order_by(Profile.id)
+        )
         return [profile_json(p, role) for p, role in rows]
 
-    @app.post('/profiles/{profile_id}/invitations', status_code=201)
-    def invite(profile_id: int, data: InviteInput, user: User = Depends(current_user), session: Session = Depends(db)):
-        membership(session, profile_id, user.id, {'owner'})
+    @app.post("/profiles/{profile_id}/invitations", status_code=201)
+    def invite(
+        profile_id: int,
+        data: InviteInput,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
+        membership(session, profile_id, user.id, {"owner"})
         code = secrets.token_urlsafe(16)
         expires = int(time.time()) + 3600
-        session.add(Invitation(profile_id=profile_id, email=data.email, role=data.role, code_hash=invite_hash(code), expires_at=expires))
+        session.add(
+            Invitation(
+                profile_id=profile_id,
+                email=data.email,
+                role=data.role,
+                code_hash=invite_hash(code),
+                expires_at=expires,
+            )
+        )
         session.commit()
-        return {'code': code, 'expires_in': 3600, 'role': data.role, 'email': data.email}
+        return {
+            "code": code,
+            "expires_in": 3600,
+            "role": data.role,
+            "email": data.email,
+        }
 
-    @app.post('/care-circle/join')
-    def join(data: JoinInput, request: Request, user: User = Depends(current_user), session: Session = Depends(db)):
-        limited(request, 'join')
-        invitation = session.scalar(select(Invitation).where(Invitation.code_hash == invite_hash(data.code)))
-        if not invitation or invitation.used or invitation.expires_at <= int(time.time()) or invitation.email != user.email:
-            raise HTTPException(400, 'Invalid or expired invitation')
-        if session.scalar(select(Membership).where(Membership.profile_id == invitation.profile_id, Membership.user_id == user.id)):
-            raise HTTPException(409, 'Already a member')
-        result = session.execute(update(Invitation).where(Invitation.id == invitation.id, Invitation.used.is_(False), Invitation.expires_at > int(time.time())).values(used=True))
+    @app.post("/care-circle/join")
+    def join(
+        data: JoinInput,
+        request: Request,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
+        limited(request, "join")
+        invitation = session.scalar(
+            select(Invitation).where(Invitation.code_hash == invite_hash(data.code))
+        )
+        if (
+            not invitation
+            or invitation.used
+            or invitation.expires_at <= int(time.time())
+            or invitation.email != user.email
+        ):
+            raise HTTPException(400, "Invalid or expired invitation")
+        if session.scalar(
+            select(Membership).where(
+                Membership.profile_id == invitation.profile_id,
+                Membership.user_id == user.id,
+            )
+        ):
+            raise HTTPException(409, "Already a member")
+        result = session.execute(
+            update(Invitation)
+            .where(
+                Invitation.id == invitation.id,
+                Invitation.used.is_(False),
+                Invitation.expires_at > int(time.time()),
+            )
+            .values(used=True)
+        )
         if result.rowcount != 1:
             session.rollback()
-            raise HTTPException(400, 'Invalid or expired invitation')
-        session.add(Membership(profile_id=invitation.profile_id, user_id=user.id, role=invitation.role))
+            raise HTTPException(400, "Invalid or expired invitation")
+        session.add(
+            Membership(
+                profile_id=invitation.profile_id, user_id=user.id, role=invitation.role
+            )
+        )
         try:
             session.commit()
         except IntegrityError:
             session.rollback()
-            raise HTTPException(409, 'Already a member')
-        return {'profile_id': invitation.profile_id, 'role': invitation.role}
+            raise HTTPException(409, "Already a member")
+        return {"profile_id": invitation.profile_id, "role": invitation.role}
 
-    @app.get('/profiles/{profile_id}/members')
-    def members(profile_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
-        membership(session, profile_id, user.id, {'owner'})
-        rows = session.execute(select(User.id, User.name, User.email, Membership.role).join(Membership, User.id == Membership.user_id).where(Membership.profile_id == profile_id))
-        return [{'user_id': uid, 'name': name, 'email': email, 'role': role} for uid, name, email, role in rows]
+    @app.get("/profiles/{profile_id}/members")
+    def members(
+        profile_id: int,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
+        membership(session, profile_id, user.id, {"owner"})
+        rows = session.execute(
+            select(User.id, User.name, User.email, Membership.role)
+            .join(Membership, User.id == Membership.user_id)
+            .where(Membership.profile_id == profile_id)
+        )
+        return [
+            {"user_id": uid, "name": name, "email": email, "role": role}
+            for uid, name, email, role in rows
+        ]
 
-    @app.delete('/profiles/{profile_id}/members/{member_id}', status_code=204)
-    def revoke(profile_id: int, member_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
-        membership(session, profile_id, user.id, {'owner'})
+    @app.delete("/profiles/{profile_id}/members/{member_id}", status_code=204)
+    def revoke(
+        profile_id: int,
+        member_id: int,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
+        membership(session, profile_id, user.id, {"owner"})
         member = membership(session, profile_id, member_id)
-        if member.role == 'owner':
-            raise HTTPException(400, 'Owner cannot be removed')
+        if member.role == "owner":
+            raise HTTPException(400, "Owner cannot be removed")
         cp.lock_profile(session, profile_id)
-        for dose in session.scalars(select(Dose).where(Dose.profile_id == profile_id, Dose.claimed_by == member_id, Dose.follow_up == 'claimed')):
-            cp.change(session, dose, int(clock()), 'follow_up_released', user.id, 'Care circle access revoked', follow_up='open', claimed_by=None)
-        pref = session.scalar(select(EmailPreference).where(EmailPreference.profile_id == profile_id, EmailPreference.user_id == member_id))
+        for dose in session.scalars(
+            select(Dose).where(
+                Dose.profile_id == profile_id,
+                Dose.claimed_by == member_id,
+                Dose.follow_up == "claimed",
+            )
+        ):
+            cp.change(
+                session,
+                dose,
+                int(clock()),
+                "follow_up_released",
+                user.id,
+                "Care circle access revoked",
+                follow_up="open",
+                claimed_by=None,
+            )
+        pref = session.scalar(
+            select(EmailPreference).where(
+                EmailPreference.profile_id == profile_id,
+                EmailPreference.user_id == member_id,
+            )
+        )
         if pref is not None:
             session.delete(pref)
-        voice_pref = session.scalar(select(VoicePreference).where(VoicePreference.profile_id == profile_id, VoicePreference.user_id == member_id))
+        voice_pref = session.scalar(
+            select(VoicePreference).where(
+                VoicePreference.profile_id == profile_id,
+                VoicePreference.user_id == member_id,
+            )
+        )
         if voice_pref is not None:
             session.delete(voice_pref)
         session.delete(member)
         session.commit()
         return Response(status_code=204)
 
-    @app.get('/profiles/{profile_id}/medications')
-    def medications(profile_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.get("/profiles/{profile_id}/medications")
+    def medications(
+        profile_id: int,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         membership(session, profile_id, user.id)
-        return [med_json(m) for m in session.scalars(select(Medication).where(Medication.profile_id == profile_id).order_by(Medication.id))]
+        return [
+            med_json(m)
+            for m in session.scalars(
+                select(Medication)
+                .where(Medication.profile_id == profile_id)
+                .order_by(Medication.id)
+            )
+        ]
 
-    @app.post('/profiles/{profile_id}/medications', status_code=201)
-    def add_med(profile_id: int, data: MedicationInput, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.post("/profiles/{profile_id}/medications", status_code=201)
+    def add_med(
+        profile_id: int,
+        data: MedicationInput,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         p = cp.lock_profile(session, profile_id)
-        membership(session, profile_id, user.id, {'owner', 'caregiver'})
-        m = Medication(profile_id=profile_id, **data.model_dump(exclude={'times'}), times=','.join(data.times))
+        membership(session, profile_id, user.id, {"owner", "caregiver"})
+        m = Medication(
+            profile_id=profile_id,
+            **data.model_dump(exclude={"times"}),
+            times=",".join(data.times),
+        )
         session.add(m)
         session.flush()
         cp.seed_medication(session, p, m, int(clock()))
         session.commit()
         return med_json(m)
 
-    @app.put('/profiles/{profile_id}/medications/{item_id}')
-    def edit_med(profile_id: int, item_id: int, data: MedicationInput, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.put("/profiles/{profile_id}/medications/{item_id}")
+    def edit_med(
+        profile_id: int,
+        item_id: int,
+        data: MedicationInput,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         p = cp.lock_profile(session, profile_id)
-        membership(session, profile_id, user.id, {'owner', 'caregiver'})
+        membership(session, profile_id, user.id, {"owner", "caregiver"})
         m = item_for(session, Medication, profile_id, item_id)
         now = int(clock())
         cp.cancel_future(session, m, now)
-        for key, value in data.model_dump(exclude={'times'}).items():
+        for key, value in data.model_dump(exclude={"times"}).items():
             setattr(m, key, value)
-        m.times = ','.join(data.times)
+        m.times = ",".join(data.times)
         cp.seed_medication(session, p, m, now)
         session.commit()
         return med_json(m)
 
-    @app.delete('/profiles/{profile_id}/medications/{item_id}', status_code=204)
-    def delete_med(profile_id: int, item_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.delete("/profiles/{profile_id}/medications/{item_id}", status_code=204)
+    def delete_med(
+        profile_id: int,
+        item_id: int,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         cp.lock_profile(session, profile_id)
-        membership(session, profile_id, user.id, {'owner', 'caregiver'})
+        membership(session, profile_id, user.id, {"owner", "caregiver"})
         m = item_for(session, Medication, profile_id, item_id)
         cp.cancel_future(session, m, int(clock()))
-        supply = session.scalar(select(MedicationSupply).where(MedicationSupply.profile_id == profile_id, MedicationSupply.medication_id == m.id))
+        supply = session.scalar(
+            select(MedicationSupply).where(
+                MedicationSupply.profile_id == profile_id,
+                MedicationSupply.medication_id == m.id,
+            )
+        )
         if supply is not None:
             session.delete(supply)
             session.flush()
@@ -306,77 +534,149 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
         session.commit()
         return Response(status_code=204)
 
-    @app.get('/profiles/{profile_id}/appointments')
-    def appointments(profile_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.get("/profiles/{profile_id}/appointments")
+    def appointments(
+        profile_id: int,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         membership(session, profile_id, user.id)
-        return [appt_json(a) for a in session.scalars(select(Appointment).where(Appointment.profile_id == profile_id).order_by(Appointment.starts_at))]
+        return [
+            appt_json(a)
+            for a in session.scalars(
+                select(Appointment)
+                .where(Appointment.profile_id == profile_id)
+                .order_by(Appointment.starts_at)
+            )
+        ]
 
-    @app.post('/profiles/{profile_id}/appointments', status_code=201)
-    def add_appt(profile_id: int, data: AppointmentInput, user: User = Depends(current_user), session: Session = Depends(db)):
-        membership(session, profile_id, user.id, {'owner', 'caregiver'})
-        a = Appointment(profile_id=profile_id, **data.model_dump(exclude={'starts_at'}), starts_at=data.starts_at.isoformat())
+    @app.post("/profiles/{profile_id}/appointments", status_code=201)
+    def add_appt(
+        profile_id: int,
+        data: AppointmentInput,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
+        membership(session, profile_id, user.id, {"owner", "caregiver"})
+        a = Appointment(
+            profile_id=profile_id,
+            **data.model_dump(exclude={"starts_at"}),
+            starts_at=data.starts_at.isoformat(),
+        )
         session.add(a)
         session.commit()
         return appt_json(a)
 
-    @app.put('/profiles/{profile_id}/appointments/{item_id}')
-    def edit_appt(profile_id: int, item_id: int, data: AppointmentInput, user: User = Depends(current_user), session: Session = Depends(db)):
-        membership(session, profile_id, user.id, {'owner', 'caregiver'})
+    @app.put("/profiles/{profile_id}/appointments/{item_id}")
+    def edit_appt(
+        profile_id: int,
+        item_id: int,
+        data: AppointmentInput,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
+        membership(session, profile_id, user.id, {"owner", "caregiver"})
         a = item_for(session, Appointment, profile_id, item_id)
-        for key, value in data.model_dump(exclude={'starts_at'}).items():
+        for key, value in data.model_dump(exclude={"starts_at"}).items():
             setattr(a, key, value)
         a.starts_at = data.starts_at.isoformat()
         session.commit()
         return appt_json(a)
 
-    @app.delete('/profiles/{profile_id}/appointments/{item_id}', status_code=204)
-    def delete_appt(profile_id: int, item_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
-        membership(session, profile_id, user.id, {'owner', 'caregiver'})
+    @app.delete("/profiles/{profile_id}/appointments/{item_id}", status_code=204)
+    def delete_appt(
+        profile_id: int,
+        item_id: int,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
+        membership(session, profile_id, user.id, {"owner", "caregiver"})
         session.delete(item_for(session, Appointment, profile_id, item_id))
         session.commit()
         return Response(status_code=204)
 
-    @app.post('/profiles/{profile_id}/carepulse/refresh')
-    def refresh_care(profile_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.post("/profiles/{profile_id}/carepulse/refresh")
+    def refresh_care(
+        profile_id: int,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         p = cp.lock_profile(session, profile_id)
-        membership(session, profile_id, user.id, {'owner', 'caregiver'})
+        membership(session, profile_id, user.id, {"owner", "caregiver"})
         count = cp.refresh(session, p, int(clock()))
         session.commit()
-        return {'new_unconfirmed': count}
+        return {"new_unconfirmed": count}
 
-    @app.get('/profiles/{profile_id}/carepulse/doses')
-    def list_doses(profile_id: int, limit: int = Query(100, ge=1, le=500),
-                   offset: int = Query(0, ge=0), user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.get("/profiles/{profile_id}/carepulse/doses")
+    def list_doses(
+        profile_id: int,
+        limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         membership(session, profile_id, user.id)
-        rows = session.scalars(select(Dose).where(Dose.profile_id == profile_id, Dose.status != 'cancelled')
-                   .order_by(Dose.due_at.desc(), Dose.id.desc()).offset(offset).limit(limit))
+        rows = session.scalars(
+            select(Dose)
+            .where(Dose.profile_id == profile_id, Dose.status != "cancelled")
+            .order_by(Dose.due_at.desc(), Dose.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
         return [cp.dose_json(d) for d in rows]
 
-    @app.get('/profiles/{profile_id}/carepulse/alerts')
-    def alerts(profile_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.get("/profiles/{profile_id}/carepulse/alerts")
+    def alerts(
+        profile_id: int,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         membership(session, profile_id, user.id)
-        rows = session.scalars(select(Dose).where(Dose.profile_id == profile_id, Dose.follow_up.in_(['open', 'claimed']))
-                   .order_by(Dose.due_at).limit(500))
+        rows = session.scalars(
+            select(Dose)
+            .where(
+                Dose.profile_id == profile_id, Dose.follow_up.in_(["open", "claimed"])
+            )
+            .order_by(Dose.due_at)
+            .limit(500)
+        )
         return [cp.dose_json(d) for d in rows]
 
-    @app.post('/profiles/{profile_id}/carepulse/doses/{dose_id}/record')
-    def record(profile_id: int, dose_id: int, data: cp.DoseAction, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.post("/profiles/{profile_id}/carepulse/doses/{dose_id}/record")
+    def record(
+        profile_id: int,
+        dose_id: int,
+        data: cp.DoseAction,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         cp.lock_profile(session, profile_id)
-        member = membership(session, profile_id, user.id, {'owner', 'caregiver'})
+        member = membership(session, profile_id, user.id, {"owner", "caregiver"})
         d = item_for(session, Dose, profile_id, dose_id)
         now = int(clock())
         previous = d.status
         cp.record_dose(session, d, data, user.id, member.role, now)
-        if previous != 'taken' and d.status == 'taken':
-            supply = session.scalar(select(MedicationSupply).where(MedicationSupply.profile_id == profile_id, MedicationSupply.medication_id == d.medication_id))
+        if previous != "taken" and d.status == "taken":
+            supply = session.scalar(
+                select(MedicationSupply).where(
+                    MedicationSupply.profile_id == profile_id,
+                    MedicationSupply.medication_id == d.medication_id,
+                )
+            )
             if supply is not None:
                 supply.remaining = max(0, supply.remaining - 1)
                 supply.updated_at = now
         session.commit()
         return cp.dose_json(d)
 
-    @app.post('/profiles/{profile_id}/carepulse/doses/{dose_id}/follow-up')
-    def handle_follow_up(profile_id: int, dose_id: int, data: cp.FollowUpAction, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.post("/profiles/{profile_id}/carepulse/doses/{dose_id}/follow-up")
+    def handle_follow_up(
+        profile_id: int,
+        dose_id: int,
+        data: cp.FollowUpAction,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         cp.lock_profile(session, profile_id)
         member = membership(session, profile_id, user.id)
         d = item_for(session, Dose, profile_id, dose_id)
@@ -384,18 +684,35 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
         session.commit()
         return cp.dose_json(d)
 
-    @app.get('/profiles/{profile_id}/carepulse/timeline')
-    def timeline(profile_id: int, limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0),
-                 user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.get("/profiles/{profile_id}/carepulse/timeline")
+    def timeline(
+        profile_id: int,
+        limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         membership(session, profile_id, user.id)
-        rows = session.scalars(select(CareEvent).where(CareEvent.profile_id == profile_id)
-                               .order_by(CareEvent.at.desc(), CareEvent.id.desc()).offset(offset).limit(limit))
+        rows = session.scalars(
+            select(CareEvent)
+            .where(CareEvent.profile_id == profile_id)
+            .order_by(CareEvent.at.desc(), CareEvent.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
         return [cp.event_json(e) for e in rows]
 
-    @app.post('/internal/carepulse/refresh')
-    def scheduler_refresh(x_scheduler_token: str | None = Header(default=None), session: Session = Depends(db)):
-        if not scheduler_secret or not x_scheduler_token or not hmac.compare_digest(scheduler_secret, x_scheduler_token):
-            raise HTTPException(401, 'Invalid scheduler credentials')
+    @app.post("/internal/carepulse/refresh")
+    def scheduler_refresh(
+        x_scheduler_token: str | None = Header(default=None),
+        session: Session = Depends(db),
+    ):
+        if (
+            not scheduler_secret
+            or not x_scheduler_token
+            or not hmac.compare_digest(scheduler_secret, x_scheduler_token)
+        ):
+            raise HTTPException(401, "Invalid scheduler credentials")
         now = int(clock())
         ids = list(session.scalars(select(Profile.id).order_by(Profile.id)))
         count = 0
@@ -403,37 +720,82 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
             p = cp.lock_profile(session, pid)
             count += cp.refresh(session, p, now)
             session.commit()
-        return {'profiles_processed': len(ids), 'new_unconfirmed': count}
+        return {"profiles_processed": len(ids), "new_unconfirmed": count}
 
     def scheduler_auth(token):
-        if not scheduler_secret or not token or not hmac.compare_digest(scheduler_secret, token):
-            raise HTTPException(401, 'Invalid scheduler credentials')
+        if (
+            not scheduler_secret
+            or not token
+            or not hmac.compare_digest(scheduler_secret, token)
+        ):
+            raise HTTPException(401, "Invalid scheduler credentials")
 
-    @app.get('/profiles/{profile_id}/email-reminders')
-    def email_preferences(profile_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.get("/profiles/{profile_id}/email-reminders")
+    def email_preferences(
+        profile_id: int,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         membership(session, profile_id, user.id)
-        pref = session.scalar(select(EmailPreference).where(EmailPreference.profile_id == profile_id, EmailPreference.user_id == user.id))
-        attempts = session.scalars(select(EmailAttempt).where(EmailAttempt.profile_id == profile_id, EmailAttempt.user_id == user.id).order_by(EmailAttempt.id.desc()).limit(10))
-        return {'available': user.email in demo_email_allowlist, 'enabled': bool(pref and pref.enabled),
-                'recent': [{'kind': a.kind, 'status': a.status, 'at': cp.iso(a.created_at)} for a in attempts]}
+        pref = session.scalar(
+            select(EmailPreference).where(
+                EmailPreference.profile_id == profile_id,
+                EmailPreference.user_id == user.id,
+            )
+        )
+        attempts = session.scalars(
+            select(EmailAttempt)
+            .where(
+                EmailAttempt.profile_id == profile_id, EmailAttempt.user_id == user.id
+            )
+            .order_by(EmailAttempt.id.desc())
+            .limit(10)
+        )
+        return {
+            "available": user.email in demo_email_allowlist,
+            "enabled": bool(pref and pref.enabled),
+            "recent": [
+                {"kind": a.kind, "status": a.status, "at": cp.iso(a.created_at)}
+                for a in attempts
+            ],
+        }
 
-    @app.put('/profiles/{profile_id}/email-reminders')
-    def set_email_preferences(profile_id: int, data: nt.Preference, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.put("/profiles/{profile_id}/email-reminders")
+    def set_email_preferences(
+        profile_id: int,
+        data: nt.Preference,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         cp.lock_profile(session, profile_id)
         membership(session, profile_id, user.id)
         if data.enabled and user.email not in demo_email_allowlist:
-            raise HTTPException(403, 'This demo inbox has not been approved by the deployment administrator')
-        pref = session.scalar(select(EmailPreference).where(EmailPreference.profile_id == profile_id, EmailPreference.user_id == user.id))
+            raise HTTPException(
+                403,
+                "This demo inbox has not been approved by the deployment administrator",
+            )
+        pref = session.scalar(
+            select(EmailPreference).where(
+                EmailPreference.profile_id == profile_id,
+                EmailPreference.user_id == user.id,
+            )
+        )
         if pref is None:
-            pref = EmailPreference(profile_id=profile_id, user_id=user.id, enabled=data.enabled)
+            pref = EmailPreference(
+                profile_id=profile_id, user_id=user.id, enabled=data.enabled
+            )
             session.add(pref)
         else:
             pref.enabled = data.enabled
         session.commit()
-        return {'enabled': pref.enabled}
+        return {"enabled": pref.enabled}
 
-    @app.post('/internal/email/dispatch')
-    def email_dispatch(limit: int = Query(10, ge=1, le=20), x_scheduler_token: str | None = Header(default=None), session: Session = Depends(db)):
+    @app.post("/internal/email/dispatch")
+    def email_dispatch(
+        limit: int = Query(10, ge=1, le=20),
+        x_scheduler_token: str | None = Header(default=None),
+        session: Session = Depends(db),
+    ):
         scheduler_auth(x_scheduler_token)
         now = int(clock())
         ids = list(session.scalars(select(Profile.id).order_by(Profile.id)))
@@ -441,139 +803,302 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
         for pid in ids:
             p = cp.lock_profile(session, pid)
             cp.refresh(session, p, now)
-            messages.extend(nt.dispatch(session, pid, now, demo_email_allowlist, limit-len(messages)))
+            messages.extend(
+                nt.dispatch(
+                    session, pid, now, demo_email_allowlist, limit - len(messages)
+                )
+            )
             session.commit()
-        return {'messages': messages}
+        return {"messages": messages}
 
-    @app.post('/internal/email/{attempt_id}/result')
-    def email_result(attempt_id: int, data: nt.DeliveryResult, x_scheduler_token: str | None = Header(default=None), session: Session = Depends(db)):
+    @app.post("/internal/email/{attempt_id}/result")
+    def email_result(
+        attempt_id: int,
+        data: nt.DeliveryResult,
+        x_scheduler_token: str | None = Header(default=None),
+        session: Session = Depends(db),
+    ):
         scheduler_auth(x_scheduler_token)
         row = session.get(EmailAttempt, attempt_id)
         if row is None:
-            raise HTTPException(404, 'Attempt not found')
+            raise HTTPException(404, "Attempt not found")
         if row.status == data.status:
-            return {'status': row.status}
-        result = session.execute(update(EmailAttempt).where(EmailAttempt.id == attempt_id, EmailAttempt.status == 'dispatched').values(status=data.status))
+            return {"status": row.status}
+        result = session.execute(
+            update(EmailAttempt)
+            .where(EmailAttempt.id == attempt_id, EmailAttempt.status == "dispatched")
+            .values(status=data.status)
+        )
         if result.rowcount != 1:
-            raise HTTPException(409, 'Attempt already finalized')
+            raise HTTPException(409, "Attempt already finalized")
         session.commit()
-        return {'status': data.status}
+        return {"status": data.status}
 
-    @app.get('/profiles/{profile_id}/voice-reminders')
-    def voice_preferences(profile_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.get("/profiles/{profile_id}/voice-reminders")
+    def voice_preferences(
+        profile_id: int,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         membership(session, profile_id, user.id)
-        pref = session.scalar(select(VoicePreference).where(VoicePreference.profile_id == profile_id, VoicePreference.user_id == user.id))
-        attempts = session.scalars(select(VoiceAttempt).where(VoiceAttempt.profile_id == profile_id, VoiceAttempt.user_id == user.id).order_by(VoiceAttempt.id.desc()).limit(10))
+        pref = session.scalar(
+            select(VoicePreference).where(
+                VoicePreference.profile_id == profile_id,
+                VoicePreference.user_id == user.id,
+            )
+        )
+        attempts = session.scalars(
+            select(VoiceAttempt)
+            .where(
+                VoiceAttempt.profile_id == profile_id, VoiceAttempt.user_id == user.id
+            )
+            .order_by(VoiceAttempt.id.desc())
+            .limit(10)
+        )
         number = voice_recipients.get(user.email)
-        return {'available': bool(number), 'number_ending': number[-4:] if number else None,
-                'enabled': bool(pref and pref.enabled), 'threshold_minutes': voice_threshold,
-                'recent': [{'status': a.status, 'at': cp.iso(a.created_at)} for a in attempts]}
+        return {
+            "available": bool(number),
+            "number_ending": number[-4:] if number else None,
+            "enabled": bool(pref and pref.enabled),
+            "threshold_minutes": voice_threshold,
+            "recent": [
+                {"status": a.status, "at": cp.iso(a.created_at)} for a in attempts
+            ],
+        }
 
-    @app.put('/profiles/{profile_id}/voice-reminders')
-    def set_voice_preferences(profile_id: int, data: nt.Preference, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.put("/profiles/{profile_id}/voice-reminders")
+    def set_voice_preferences(
+        profile_id: int,
+        data: nt.Preference,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         cp.lock_profile(session, profile_id)
         membership(session, profile_id, user.id)
         if data.enabled and user.email not in voice_recipients:
-            raise HTTPException(403, 'No consenting test number is approved for this account')
-        pref = session.scalar(select(VoicePreference).where(VoicePreference.profile_id == profile_id, VoicePreference.user_id == user.id))
+            raise HTTPException(
+                403, "No consenting test number is approved for this account"
+            )
+        pref = session.scalar(
+            select(VoicePreference).where(
+                VoicePreference.profile_id == profile_id,
+                VoicePreference.user_id == user.id,
+            )
+        )
         if pref is None:
-            session.add(VoicePreference(profile_id=profile_id, user_id=user.id, enabled=data.enabled))
+            session.add(
+                VoicePreference(
+                    profile_id=profile_id, user_id=user.id, enabled=data.enabled
+                )
+            )
         else:
             pref.enabled = data.enabled
         session.commit()
-        return {'enabled': data.enabled}
+        return {"enabled": data.enabled}
 
-    @app.post('/internal/voice/dispatch')
-    def voice_dispatch(limit: int = Query(3, ge=1, le=5), x_scheduler_token: str | None = Header(default=None), session: Session = Depends(db)):
+    @app.post("/internal/voice/dispatch")
+    def voice_dispatch(
+        limit: int = Query(3, ge=1, le=5),
+        x_scheduler_token: str | None = Header(default=None),
+        session: Session = Depends(db),
+    ):
         scheduler_auth(x_scheduler_token)
         now = int(clock())
         calls = []
         for pid in list(session.scalars(select(Profile.id).order_by(Profile.id))):
             p = cp.lock_profile(session, pid)
             cp.refresh(session, p, now)
-            calls.extend(vc.dispatch(session, pid, now, voice_recipients, voice_threshold, limit-len(calls)))
+            calls.extend(
+                vc.dispatch(
+                    session,
+                    pid,
+                    now,
+                    voice_recipients,
+                    voice_threshold,
+                    limit - len(calls),
+                )
+            )
             session.commit()
             if len(calls) >= limit:
                 break
-        return {'calls': calls}
+        return {"calls": calls}
 
-    @app.post('/internal/voice/{attempt_id}/result')
-    def voice_result(attempt_id: int, data: vc.VoiceResult, x_scheduler_token: str | None = Header(default=None), session: Session = Depends(db)):
+    @app.post("/internal/voice/{attempt_id}/result")
+    def voice_result(
+        attempt_id: int,
+        data: vc.VoiceResult,
+        x_scheduler_token: str | None = Header(default=None),
+        session: Session = Depends(db),
+    ):
         scheduler_auth(x_scheduler_token)
         row = session.get(VoiceAttempt, attempt_id)
         if row is None:
-            raise HTTPException(404, 'Attempt not found')
+            raise HTTPException(404, "Attempt not found")
         if row.status == data.status:
-            return {'status': row.status}
-        result = session.execute(update(VoiceAttempt).where(VoiceAttempt.id == attempt_id, VoiceAttempt.status == 'dispatched').values(status=data.status))
+            return {"status": row.status}
+        result = session.execute(
+            update(VoiceAttempt)
+            .where(VoiceAttempt.id == attempt_id, VoiceAttempt.status == "dispatched")
+            .values(status=data.status)
+        )
         if result.rowcount != 1:
-            raise HTTPException(409, 'Attempt already finalized')
+            raise HTTPException(409, "Attempt already finalized")
         session.commit()
-        return {'status': data.status}
+        return {"status": data.status}
 
     # Advanced care tools: inventory and a bounded, authorized care summary.
     def supply_json(m, stock):
-        daily = len(m.times.split(','))
+        daily = len(m.times.split(","))
         remaining = stock.remaining if stock else None
-        return {'medication_id': m.id, 'name': m.name, 'daily_doses': daily,
-                'remaining': remaining, 'threshold_days': stock.threshold_days if stock else 7,
-                'days_left': round(remaining / daily, 1) if stock else None,
-                'low': remaining <= stock.threshold_days * daily if stock else False,
-                'updated_at': cp.iso(stock.updated_at) if stock else None}
+        return {
+            "medication_id": m.id,
+            "name": m.name,
+            "daily_doses": daily,
+            "remaining": remaining,
+            "threshold_days": stock.threshold_days if stock else 7,
+            "days_left": round(remaining / daily, 1) if stock else None,
+            "low": remaining <= stock.threshold_days * daily if stock else False,
+            "updated_at": cp.iso(stock.updated_at) if stock else None,
+        }
 
-    @app.get('/profiles/{profile_id}/supplies')
-    def supplies(profile_id: int, user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.get("/profiles/{profile_id}/supplies")
+    def supplies(
+        profile_id: int,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         membership(session, profile_id, user.id)
-        rows = session.execute(select(Medication, MedicationSupply).outerjoin(
-            MedicationSupply, (MedicationSupply.medication_id == Medication.id) &
-            (MedicationSupply.profile_id == Medication.profile_id)).where(
-            Medication.profile_id == profile_id).order_by(Medication.id))
+        rows = session.execute(
+            select(Medication, MedicationSupply)
+            .outerjoin(
+                MedicationSupply,
+                (MedicationSupply.medication_id == Medication.id)
+                & (MedicationSupply.profile_id == Medication.profile_id),
+            )
+            .where(Medication.profile_id == profile_id)
+            .order_by(Medication.id)
+        )
         return [supply_json(m, stock) for m, stock in rows]
 
-    @app.put('/profiles/{profile_id}/supplies/{medication_id}')
-    def set_supply(profile_id: int, medication_id: int, data: SupplyInput,
-                   user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.put("/profiles/{profile_id}/supplies/{medication_id}")
+    def set_supply(
+        profile_id: int,
+        medication_id: int,
+        data: SupplyInput,
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         cp.lock_profile(session, profile_id)
-        membership(session, profile_id, user.id, {'owner', 'caregiver'})
+        membership(session, profile_id, user.id, {"owner", "caregiver"})
         m = item_for(session, Medication, profile_id, medication_id)
-        stock = session.scalar(select(MedicationSupply).where(MedicationSupply.profile_id == profile_id,
-                              MedicationSupply.medication_id == medication_id))
+        stock = session.scalar(
+            select(MedicationSupply).where(
+                MedicationSupply.profile_id == profile_id,
+                MedicationSupply.medication_id == medication_id,
+            )
+        )
         if stock is None:
-            stock = MedicationSupply(profile_id=profile_id, medication_id=medication_id,
-                                     remaining=data.remaining, threshold_days=data.threshold_days, updated_at=int(clock()))
+            stock = MedicationSupply(
+                profile_id=profile_id,
+                medication_id=medication_id,
+                remaining=data.remaining,
+                threshold_days=data.threshold_days,
+                updated_at=int(clock()),
+            )
             session.add(stock)
         else:
-            stock.remaining, stock.threshold_days, stock.updated_at = data.remaining, data.threshold_days, int(clock())
+            stock.remaining, stock.threshold_days, stock.updated_at = (
+                data.remaining,
+                data.threshold_days,
+                int(clock()),
+            )
         session.commit()
         return supply_json(m, stock)
 
-    @app.get('/profiles/{profile_id}/care-report')
-    def care_report(profile_id: int, days: int = Query(7, ge=1, le=30),
-                    user: User = Depends(current_user), session: Session = Depends(db)):
+    @app.get("/profiles/{profile_id}/care-report")
+    def care_report(
+        profile_id: int,
+        days: int = Query(7, ge=1, le=30),
+        user: User = Depends(current_user),
+        session: Session = Depends(db),
+    ):
         member = membership(session, profile_id, user.id)
         p = session.get(Profile, profile_id)
         now = int(clock())
         since = now - days * 86400
-        scope = (Dose.profile_id == profile_id, Dose.due_at >= since, Dose.due_at <= now,
-                 Dose.status != 'cancelled')
-        rows = session.execute(select(Dose.status, func.count(Dose.id)).where(*scope).group_by(Dose.status))
+        scope = (
+            Dose.profile_id == profile_id,
+            Dose.due_at >= since,
+            Dose.due_at <= now,
+            Dose.status != "cancelled",
+        )
+        rows = session.execute(
+            select(Dose.status, func.count(Dose.id)).where(*scope).group_by(Dose.status)
+        )
         counts = dict(rows.all())
         total = sum(counts.values())
-        medications = [med_json(m) for m in session.scalars(select(Medication).where(
-            Medication.profile_id == profile_id).order_by(Medication.name))]
-        appointments = [appt_json(a) for a in session.scalars(select(Appointment).where(
-            Appointment.profile_id == profile_id, Appointment.starts_at >= cp.iso(now)).order_by(Appointment.starts_at).limit(20))]
-        followups = [cp.dose_json(d) for d in session.scalars(select(Dose).where(
-            Dose.profile_id == profile_id, Dose.follow_up.in_(['open', 'claimed'])).order_by(Dose.due_at).limit(20))]
-        return {'profile': profile_json(p, member.role), 'from': cp.iso(since), 'to': cp.iso(now),
-                'days': days, 'counts': counts, 'total_due': total,
-                'confirmed_percent': round(100 * counts.get('taken', 0) / total, 1) if total else None,
-                'medications': medications, 'upcoming_appointments': appointments, 'open_followups': followups,
-                'note': 'Self/caregiver-reported records; unconfirmed does not mean missed. No clinical recommendations.'}
+        medications = [
+            med_json(m)
+            for m in session.scalars(
+                select(Medication)
+                .where(Medication.profile_id == profile_id)
+                .order_by(Medication.name)
+            )
+        ]
+        appointments = [
+            appt_json(a)
+            for a in session.scalars(
+                select(Appointment)
+                .where(
+                    Appointment.profile_id == profile_id,
+                    Appointment.starts_at >= cp.iso(now),
+                )
+                .order_by(Appointment.starts_at)
+                .limit(20)
+            )
+        ]
+        followups = [
+            cp.dose_json(d)
+            for d in session.scalars(
+                select(Dose)
+                .where(
+                    Dose.profile_id == profile_id,
+                    Dose.follow_up.in_(["open", "claimed"]),
+                )
+                .order_by(Dose.due_at)
+                .limit(20)
+            )
+        ]
+        return {
+            "profile": profile_json(p, member.role),
+            "from": cp.iso(since),
+            "to": cp.iso(now),
+            "days": days,
+            "counts": counts,
+            "total_due": total,
+            "confirmed_percent": round(100 * counts.get("taken", 0) / total, 1)
+            if total
+            else None,
+            "medications": medications,
+            "upcoming_appointments": appointments,
+            "open_followups": followups,
+            "note": "Self/caregiver-reported records; unconfirmed does not mean missed. No clinical recommendations.",
+        }
 
     connected.register(app, db, current_user, membership, limited, clock, med_json)
     return app
 
 
 def create_from_env():
-    return create_app(os.getenv('DATABASE_URL', 'sqlite:///./eldercare.db'), os.environ['JWT_SECRET'], scheduler_secret=os.getenv('SCHEDULER_SECRET'), demo_email_allowlist=tuple(e.strip().lower() for e in os.getenv('DEMO_EMAIL_ALLOWLIST','').split(',') if e.strip()), voice_recipients=vc.approved_numbers(os.getenv('DEMO_VOICE_RECIPIENTS','{}')), voice_threshold=int(os.getenv('VOICE_ESCALATION_MINUTES','60')))
+    return create_app(
+        os.getenv("DATABASE_URL", "sqlite:///./eldercare.db"),
+        os.environ["JWT_SECRET"],
+        scheduler_secret=os.getenv("SCHEDULER_SECRET"),
+        demo_email_allowlist=tuple(
+            e.strip().lower()
+            for e in os.getenv("DEMO_EMAIL_ALLOWLIST", "").split(",")
+            if e.strip()
+        ),
+        voice_recipients=vc.approved_numbers(os.getenv("DEMO_VOICE_RECIPIENTS", "{}")),
+        voice_threshold=int(os.getenv("VOICE_ESCALATION_MINUTES", "60")),
+    )
