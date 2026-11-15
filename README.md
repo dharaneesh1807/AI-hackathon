@@ -56,3 +56,18 @@ The internal endpoint is disabled unless a separate `SCHEDULER_SECRET` is config
 Record body: `{"status":"taken"}`. Follow-up body: `{"action":"claim"}` or `{"action":"resolve","note":"Contacted patient; outcome recorded"}`. Use fictional patient data only. This is a prototype, not medical monitoring or emergency response. It does not recommend taking an additional dose, changing medication, or changing clinical instructions.
 
 Tests: `python -m pytest -q` (10 tests: 5 original + 5 CarePulse). The automated tests use SQLite and an injected clock; PostgreSQL concurrency and deployment, email delivery, user-facing accessibility, and clinical readiness are not yet verified. PostgreSQL row locks serialize per-profile modifications; SQLite is intended for local single-instance testing. A prolonged scheduler outage beyond the generation horizon needs an explicit reconciliation process.
+
+## Phase 3 — browser interface
+
+Run `python -m pytest -q` and start the existing server:
+
+```sh
+python -m uvicorn backend.main:create_from_env --factory --reload
+```
+
+Open http://127.0.0.1:8000/ for the application or `/docs` for API documentation.
+No Node.js, npm, external CDN, or frontend build step is needed. The responsive HTML/CSS/JavaScript application is served from FastAPI on the same origin. API routes are unchanged except `/` now serves the website. Authentication tokens are kept in memory; reloading the page requires signing in again. Data remains in the database. All profile authorization is enforced by the backend.
+
+Try registering a fictional account, creating a profile, adding a medication with a future daily time, and refreshing the care status after the scheduled time. Create a second account with a different fictional email, generate an invitation as the owner, and join as the invited account. Use the profile owner's or caregiver's dashboard to add/edit schedules, record actual dose status, and claim/resolve follow-ups. The family role can read records and coordinate follow-ups but cannot edit prescriptions or record adherence. Appointment time input uses the device timezone and display uses the profile timezone. The CarePulse engine uses a seven-day future schedule horizon; the dashboard retrieves up to 500 dose records and 100 timeline records.
+
+Comfort mode includes larger medication controls, simplified navigation, English/Tamil labels for key actions, and browser speech synthesis (voice availability varies). Other screens and some labels remain English. This is not a complete localization or accessibility certification. Automatic scheduler execution, email delivery, Google Calendar synchronization, production database verification and deployment are still pending. Do not use real healthcare data or rely on the prototype for clinical care.

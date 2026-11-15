@@ -4,6 +4,7 @@ import hmac
 import os
 import secrets
 import time
+from pathlib import Path
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from threading import Lock
@@ -13,6 +14,8 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import create_engine, select, update
 from sqlalchemy.exc import IntegrityError
@@ -46,7 +49,7 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
         yield
         engine.dispose()
 
-    app = FastAPI(title='Catalyst ElderCare', version='0.2.0', lifespan=lifespan)
+    app = FastAPI(title='Catalyst ElderCare', version='0.3.0', lifespan=lifespan)
 
     def db():
         with sessions() as session:
@@ -108,9 +111,24 @@ def create_app(database_url: str, secret: str, clock=time.time, scheduler_secret
     def profile_json(p, role):
         return {'id': p.id, 'name': p.name, 'timezone': p.timezone, 'role': role}
 
-    @app.get('/')
+    web = Path(__file__).resolve().parent / 'web'
+    app.mount('/assets', StaticFiles(directory=web), name='assets')
+
+    @app.get('/', include_in_schema=False)
     def root():
-        return {'service': 'Catalyst ElderCare', 'phase': 2, 'docs': '/docs'}
+        return FileResponse(web / 'index.html', headers={'Cache-Control': 'no-cache'})
+
+    @app.middleware('http')
+    async def browser_security(request: Request, call_next):
+        response = await call_next(request)
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['Referrer-Policy'] = 'no-referrer'
+        response.headers['X-Frame-Options'] = 'DENY'
+        if request.url.path == '/' or request.url.path.startswith('/assets/'):
+            response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        else:
+            response.headers['Cache-Control'] = 'no-store'
+        return response
 
     @app.get('/health')
     def health(session: Session = Depends(db)):
