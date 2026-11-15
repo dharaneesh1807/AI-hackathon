@@ -76,3 +76,12 @@ class AppointmentInput(Input):
     @classmethod
     def to_utc(cls, value: datetime):
         return value.astimezone(timezone.utc)
+
+
+class DisplayNameInput(Input):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class SupplyInput(Input):
+    remaining: int = Field(ge=0, le=100000, strict=True)
+    threshold_days: int = Field(default=7, ge=1, le=30, strict=True)
